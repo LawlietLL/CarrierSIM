@@ -152,7 +152,8 @@ def sweep_profiles():
     print('\n  Скрипт по очереди поставит каждый профиль и после каждого 2 минуты читает журнал связи.\n'
           '  Во время замера по подсказке включите и выключите авиарежим. Wi-Fi держите включённым, VPN выключенным.\n'
           '  В конце останется профиль, с которым заработало больше всего (VoWiFi, 5G, VoLTE).\n'
-          '  Enter: Vodafone_hu, O2_Germany, Swisscom_ch, AVEA_tr. Или свой список через запятую.\n'
+          '  Enter: Vodafone_hu, Telefonica_es, One_at, Hutchison_at, Vodafone_ro. Или свой список через запятую.\n'
+          '  Для VoWiFi берите пакеты с ePDG «из iOS» или «шаблон» (каталог: ios-bundles.github.io).\n'
           '  0: вернуться в меню.')
     while True:
         names = input('  Профили: ').strip()

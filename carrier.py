@@ -1541,7 +1541,12 @@ def save_epdg_lines(state, out):
 # ---- Profile sweep: install each bundle in turn, read the CommCenter log after it,
 # and compare what actually came up. Every install goes through the normal execute()
 # path with its backup, readback and rollback.
-SWEEP_DEFAULT = ('Vodafone_hu', 'O2_Germany', 'Swisscom_ch', 'AVEA_tr')
+# Only bundles that take the ePDG address from the SIM (none in the bundle, or the
+# epdg.epc.mnc$mnc.mcc$mcc template): a bundle with its own operator's ePDG sends
+# VoWiFi to that foreign server, where a Russian SIM never registers. Also IMS IPsec,
+# AKAv1-MD5, EVS, 5G switch and no Wi-Fi Calling entitlement (bit 7), per the
+# iOS 27.0 catalog at https://ios-bundles.github.io/.
+SWEEP_DEFAULT = ('Vodafone_hu', 'Telefonica_es', 'One_at', 'Hutchison_at', 'Vodafone_ro')
 
 
 def sweep_names(value):
