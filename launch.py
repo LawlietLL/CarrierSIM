@@ -117,7 +117,8 @@ def menu():
           '  6  Открыть справку\n'
           '  7  Выбрать другой профиль\n'
           '  8  Диагностика связи (IMS, VoWiFi, VoLTE, 5G) — только чтение\n'
-          '  9  Проверка звонка (кодек, канал) — только чтение\n\n'
+          '  9  Проверка звонка (кодек, канал) — только чтение\n'
+          '  10 Подобрать лучший профиль (5G, VoLTE, VoWiFi)\n\n'
           '  0  Выход\n')
     while True:
         choice = input('  Ваш выбор: ').strip()
@@ -131,7 +132,8 @@ def menu():
         if choice == '7': return other_profile()
         if choice == '8': return ['--diagnose']
         if choice == '9': return ['--watch-call']
-        print('Введите число от 0 до 9. Установка ещё не начата.')
+        if choice == '10': return sweep_profiles()
+        print('Введите число от 0 до 10. Установка ещё не начата.')
 
 
 def other_profile():
@@ -144,6 +146,21 @@ def other_profile():
         if re.fullmatch(r'[A-Za-z0-9_]+', name): break
         print('  Только латинские буквы, цифры и _. Например: O2_Germany.')
     return ['--bundle', name, '--sims', choose_sims('На какие SIM установить?')]
+
+
+def sweep_profiles():
+    print('\n  Скрипт по очереди поставит каждый профиль и после каждого 2 минуты читает журнал связи.\n'
+          '  Во время замера по подсказке включите и выключите авиарежим. Wi-Fi держите включённым, VPN выключенным.\n'
+          '  В конце останется профиль, с которым заработало больше всего (VoWiFi, 5G, VoLTE).\n'
+          '  Enter: Vodafone_hu, O2_Germany, Swisscom_ch, AVEA_tr. Или свой список через запятую.\n'
+          '  0: вернуться в меню.')
+    while True:
+        names = input('  Профили: ').strip()
+        if names == '0': return False
+        if not names or re.fullmatch(r'[A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*', names): break
+        print('  Только латинские буквы, цифры и _, через запятую. Например: Vodafone_hu,O2_Germany.')
+    return ['--sweep', *([names.replace(' ', '')] if names else []),
+            '--sims', choose_sims('Для каких SIM подбирать?')]
 
 
 def choose_sims(question):

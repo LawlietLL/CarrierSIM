@@ -1055,6 +1055,8 @@ async def execute_with_retry(args,assets):
     if args.diagnose or args.watch_call:
         # Read-only: no retries and no auto-recovery, which would write to the phone.
         return await diagnostics(args)
+    if args.sweep:
+        return await run_sweep(args, assets)
     for attempt in range(1,args.attempts+1):
         print(f'Попытка {attempt} из {args.attempts}',flush=True)
         try:return await execute(args,assets)
@@ -1221,6 +1223,52 @@ SIP_ACCESS = {'IEEE-802.11':'Wi-Fi (VoWiFi)','3GPP-E-UTRAN':'LTE (VoLTE)','3GPP-
               '3GPP-NR-TDD':'5G (VoNR)','3GPP-UTRAN-FDD':'3G'}
 
 
+# Wi-Fi calling is an IKEv2/IPsec tunnel to the operator's ePDG (3GPP TS 24.302). Its failures
+# carry standard notify names or codes: RFC 7296 for IKE itself, 8192+ for 3GPP private ones.
+# CommCenter's exact wording for them on iOS 27 is unverified, so matching is by the names and
+# codes, and matched lines are saved to epdg.txt for tuning.
+EPDG_CONTEXT = re.compile(r'\b(?:e?PDG|IKE(?:v2)?|IPsec|SWu|EAP-?AKA)\b', re.I)
+EPDG_HOST = re.compile(r'\b(epdg\.epc\.mnc\d{3}\.mcc\d{3}\.pub\.3gppnetwork\.org|[\w-]*epdg[\w.-]*\.[a-z]{2,})\b', re.I)
+EPDG_ERRORS = (
+    # (key, pattern, needs ePDG/IKE context on the line, explanation)
+    ('not_allowed', r'NON_3GPP_ACCESS_TO_EPC_NOT_ALLOWED|notify\D{0,20}\b9000\b', False,
+     'оператор не пускает эту SIM в VoWiFi: услуга не подключена на номере'),
+    ('user_unknown', r'USER_UNKNOWN|notify\D{0,20}\b9001\b', False,
+     'сеть не знает абонента для VoWiFi: услуга не подключена'),
+    ('no_apn', r'NO_APN_SUBSCRIPTION|notify\D{0,20}\b9002\b', False,
+     'нет подписки на APN ims: у номера не подключены VoLTE/VoWiFi'),
+    ('auth_rejected', r'AUTHORIZATION_REJECTED|notify\D{0,20}\b9003\b', False,
+     'оператор отклонил авторизацию VoWiFi'),
+    ('illegal_me', r'ILLEGAL_ME|IMEI_NOT_ACCEPTED|notify\D{0,20}\b(?:9006|11005)\b', False,
+     'сеть отвергла телефон по IMEI'),
+    ('rat_not_allowed', r'RAT_TYPE_NOT_ALLOWED|notify\D{0,20}\b11001\b', False,
+     'тариф не разрешает доступ через Wi-Fi'),
+    ('plmn_not_allowed', r'PLMN_NOT_ALLOWED|notify\D{0,20}\b11011\b', False,
+     'оператор запретил этот вид доступа'),
+    ('pdn_rejected', r'PDN_CONNECTION_REJECTION|MAX_CONNECTION_REACHED|notify\D{0,20}\b819[23]\b', False,
+     'оператор отказал в подключении к APN ims'),
+    ('network_failure', r'NETWORK_FAILURE|notify\D{0,20}\b10500\b', False,
+     'сбой на стороне оператора, повторите позже'),
+    ('auth_failed', r'AUTHENTICATION_FAILED|EAP[- ]?(?:AKA)?\W{0,3}fail', True,
+     'проверка SIM (EAP-AKA) не прошла: сервер не принял SIM, попробуйте другой профиль'),
+    ('no_proposal', r'NO_PROPOSAL_CHOSEN', True,
+     'шифрование IKE в профиле не подходит серверу оператора: попробуйте другой профиль'),
+    ('dns', r'(?:resolv|DNS|lookup|getaddrinfo).{0,80}(?:fail|error|NXDOMAIN|not found|timed? ?out)', True,
+     'адрес сервера VoWiFi не находится: DNS роутера или VPN, либо у оператора нет ePDG'),
+    ('timeout', r'(?:time ?out|timed out|no response|retransmi\w* (?:limit|exceed)|unreachable)', True,
+     'сервер VoWiFi не отвечает: роутер, VPN или провайдер режут UDP 500/4500'),
+)
+EPDG_ERRORS = tuple((k, re.compile(p, re.I), ctx, text) for k, p, ctx, text in EPDG_ERRORS)
+
+
+def epdg_scan(msg):
+    # -> (is ePDG/IKE line, host or None, [error keys])
+    context = bool(EPDG_CONTEXT.search(msg))
+    host = EPDG_HOST.search(msg)
+    errors = [k for k, pat, ctx, _ in EPDG_ERRORS if (context or not ctx) and pat.search(msg)]
+    return context or bool(host) or bool(errors), host and host.group(1).lower(), errors
+
+
 CODEC_NAMES = {'EVS/16000':'EVS (HD Voice+)','AMR-WB/16000':'AMR-WB (HD Voice)',
                'AMR/8000':'AMR-NB (обычное качество)','PCMA/8000':'G.711 A-law (обычное качество)',
                'PCMU/8000':'G.711 µ-law (обычное качество)'}
@@ -1308,6 +1356,15 @@ def diag_collect(state):
         for key, pat in DIAG_PATTERNS.items():
             if m := pat.search(msg):
                 state.setdefault(slot, {})[key] = m.groups()
+        seen, host, errors = epdg_scan(msg)
+        if seen:
+            s = state.setdefault(slot, {})
+            s['epdg_seen'] = s.get('epdg_seen', 0) + 1
+            if host: s['epdg_host'] = host
+            for k in errors:
+                s.setdefault('epdg_errors', {})[k] = None  # ordered set
+            lines = state.setdefault('_epdg_lines', [])
+            if len(lines) < 400: lines.append(f'{e.timestamp:%H:%M:%S} {msg}')
         if sip := feed_sip(e):
             _, access, codec = sip
             if access:
@@ -1354,13 +1411,71 @@ def diag_report(state, rows):
             ('5G SA', g('sa') and (g('sa') == 'enabled' and 'включён' or f"выключен ({g('sa',1) or 'причина не указана'})")),
             ('Звонок через', g('call_access')),
             ('Кодек звонка', g('codec') and CODEC_NAMES.get(g('codec'), g('codec'))),
+            ('Сервер VoWiFi', s.get('epdg_host')),
+            ('Ошибки VoWiFi', s.get('epdg_errors') and '; '.join(
+                text for k, _, _, text in EPDG_ERRORS if k in s['epdg_errors'])),
         ]
         shown = [(name, val) for name, val in items if val]
         for name, val in shown:
             lines.append(f'    {name:20} {val}')
         if len(shown) < len(items):
             lines.append('    остальное: нет в журнале за это время')
+        for hint in diag_hints(s):
+            lines.append('    → ' + hint)
     return '\n'.join(lines)
+
+
+def is_on(v):
+    return str(v).lower() in ('true', 'ktrue', 'on', 'enabled', 'yes', '1')
+
+
+def is_off(v):
+    return str(v).lower() in ('false', 'kfalse', 'off', 'disabled', 'no', '0')
+
+
+def vowifi_up(s):
+    over = s.get('ims_over_wifi')
+    reg = s.get('ims_reg')
+    return bool((over and is_on(over[0]) and is_on(over[1])) or s.get('wifi_name')
+                or (reg and re.search(r'wi-?fi|wlan|iwlan', reg[1] or '', re.I))
+                or (s.get('call_access') and 'Wi-Fi' in s['call_access'][0]))
+
+
+def nr_seen(s):
+    return 'kRatNR' in ((s.get('rat') or ('',))[0], (s.get('plmn') or ('',))[0])
+
+
+def volte_up(s):
+    reg = s.get('ims_reg')
+    return bool((s.get('ims_voice') and is_on(s['ims_voice'][0]))
+                or (reg and re.search(r'lte|nr|3gpp', reg[1] or '', re.I)))
+
+
+def diag_hints(s):
+    # What to do next, from the most basic cause up.
+    if not s:
+        return []
+    features, pref = s.get('features'), s.get('vowifi_pref')
+    if vowifi_up(s):
+        return ['VoWiFi работает.']
+    if features and is_off(features[2]):
+        return ['Профиль не разрешает VoWiFi. Поставьте другой профиль (пункт 7) или подберите его (пункт 10).']
+    if pref and is_off(pref[0]):
+        return ['В настройках выключены «Вызовы по Wi-Fi»: Настройки → Сотовая связь → SIM → Вызовы по Wi-Fi.']
+    errors = s.get('epdg_errors') or {}
+    if any(k in errors for k in ('not_allowed', 'user_unknown', 'no_apn', 'auth_rejected', 'rat_not_allowed',
+                                  'plmn_not_allowed', 'pdn_rejected')):
+        return ['Отказ пришёл от оператора. Профиль тут не поможет: подключите VoLTE/«Звонки по Wi-Fi» '
+                'на номере (приложение оператора или поддержка).']
+    if 'dns' in errors or 'timeout' in errors:
+        return ['До сервера VoWiFi не доходят пакеты. Выключите VPN и проверьте другую сеть Wi-Fi '
+                '(например, раздачу с другого телефона).']
+    if 'auth_failed' in errors or 'no_proposal' in errors:
+        return ['Сервер оператора не принял настройки этого профиля. Попробуйте другой профиль (пункт 10).']
+    if not s.get('epdg_seen'):
+        return ['Попыток подключиться к серверу VoWiFi в журнале нет. Включите авиарежим при включённом Wi-Fi '
+                'и запустите диагностику ещё раз.']
+    return ['Причина в журнале не распознана. Строки про VoWiFi сохранены в epdg.txt.']
 
 
 async def run_diagnose(device, args, rows):
@@ -1373,6 +1488,7 @@ async def run_diagnose(device, args, rows):
     report = diag_report(state, rows)
     print(report, flush=True)
     (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
+    save_epdg_lines(state, out)
     print(f'\nСлот SIM определяется по журналу эвристически. Журнал (замаскирован): {out}', flush=True)
     return 0
 
@@ -1399,6 +1515,7 @@ async def run_watch_call(device, args, rows):
     report = diag_report(state, rows)
     print(report, flush=True)
     (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
+    save_epdg_lines(state, out)
     print(f'\nЖурнал (замаскирован): {out}', flush=True)
     return 0
 
@@ -1414,6 +1531,135 @@ async def diagnostics(args):
         print(flush=True)
         return await (run_diagnose if args.diagnose else run_watch_call)(device,args,rows)
     finally:await device.close()
+
+
+def save_epdg_lines(state, out):
+    if lines := state.get('_epdg_lines'):
+        (out / 'epdg.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+
+# ---- Profile sweep: install each bundle in turn, read the CommCenter log after it,
+# and compare what actually came up. Every install goes through the normal execute()
+# path with its backup, readback and rollback.
+SWEEP_DEFAULT = ('Vodafone_hu', 'O2_Germany', 'Swisscom_ch', 'AVEA_tr')
+
+
+def sweep_names(value):
+    names = [n.strip().removesuffix('.bundle') for n in value.split(',') if n.strip()]
+    require(names, '--sweep: укажите профили через запятую, например Vodafone_hu,O2_Germany.')
+    for n in names:
+        require(re.fullmatch(r'[A-Za-z0-9_]+', n), f'--sweep: неверное имя профиля «{n}».')
+    require(len(set(names)) == len(names), '--sweep: профиль указан дважды.')
+    require(len(names) <= 12, '--sweep: не больше 12 профилей за раз.')
+    return names
+
+
+def sweep_score(r):
+    return 2 * r['vowifi'] + 2 * r['nr'] + r['volte']
+
+
+async def sweep_measure(args, out):
+    device = await ready_device(args.udid, args.wait_seconds)
+    try:
+        rows = await device.get_value(key='CarrierBundleInfoArray') or []
+        print(f'Замер {args.seconds} с. Сейчас: Wi-Fi включён, включите авиарежим, через 15 секунд '
+              'выключите его и ждите. Ничего больше не трогайте.', flush=True)
+        state = {}
+        out.mkdir(parents=True, mode=0o700)
+        await commcenter_stream(device, args.seconds, out / 'commcenter.log', diag_collect(state))
+        report = diag_report(state, rows)
+        (out / 'report.txt').write_text(report + '\n', encoding='utf-8')
+        save_epdg_lines(state, out)
+        return state, rows
+    finally:
+        await device.close()
+
+
+def sweep_rows(name, state, rows, slots):
+    result = []
+    common = state.get('общее', {})
+    for row in rows:
+        slot = row.get('Slot')
+        if slot not in slots: continue
+        # Lines without a known slot count for every SIM: with one SIM that is exact.
+        s = {**common, **state.get(slot, {})}
+        if 'epdg_errors' in common or 'epdg_errors' in state.get(slot, {}):
+            s['epdg_errors'] = {**common.get('epdg_errors', {}), **state.get(slot, {}).get('epdg_errors', {})}
+        result.append({'bundle': name, 'slot': slot, 'plmn': f"{row.get('MCC','')}{row.get('MNC','')}",
+                       'vowifi': vowifi_up(s), 'nr': nr_seen(s), 'volte': volte_up(s),
+                       'errors': list(s.get('epdg_errors') or {}), 'hint': (diag_hints(s) or [''])[0]})
+    return result
+
+
+def sweep_table(results):
+    mark = lambda v: 'да' if v else 'нет'
+    lines = [f"  {'Профиль':16} {'SIM':6} {'5G':4} {'VoLTE':6} {'VoWiFi':7} Итог"]
+    for r in results:
+        if 'skipped' in r:
+            lines.append(f"  {r['bundle']:16} {'':6} {'':4} {'':6} {'':7} пропущен: {r['skipped']}")
+            continue
+        errors = '; '.join(text for k, _, _, text in EPDG_ERRORS if k in r['errors'])
+        lines.append(f"  {r['bundle']:16} {SLOT_NAMES[r['slot']]:6} {mark(r['nr']):4} {mark(r['volte']):6} "
+                     f"{mark(r['vowifi']):7} {errors or r['hint']}")
+    return '\n'.join(lines)
+
+
+async def run_sweep(args, assets):
+    names = sweep_names(args.sweep)
+    slots = SLOT_CHOICES[args.sims]
+    out = args.runs / (datetime.now().strftime('%Y%m%d-%H%M%S-') + 'sweep')
+    out.mkdir(parents=True, mode=0o700)
+    print(f'Подбор профиля: {", ".join(names)}.\nДля каждого: установка, затем замер {args.seconds} с. '
+          'Держите iPhone разблокированным и подключённым, Wi-Fi включённым, VPN выключенным.', flush=True)
+    results = []
+
+    async def install(name):
+        sub = argparse.Namespace(**vars(args))
+        sub.sweep = None; sub.bundle = name + '.bundle'; sub.bundles = {'default': sub.bundle}
+        return await execute_with_retry(sub, assets)
+
+    for i, name in enumerate(names, 1):
+        print(f'\n===== Профиль {i} из {len(names)}: {name} =====', flush=True)
+        try:
+            code = await install(name)
+        except Exception as error:
+            # execute_with_retry has already rolled back; a stage it could not undo stops the sweep.
+            if pending(args.runs, args.udid): raise
+            print(f'Профиль {name} не установлен: {error}', flush=True)
+            results.append({'bundle': name, 'skipped': 'ошибка установки'}); continue
+        if code == 2:
+            results.append({'bundle': name, 'skipped': 'iOS его не выбрала'}); continue
+        state, rows = await sweep_measure(args, out / name)
+        rows_now = sweep_rows(name, state, rows, slots)
+        results.extend(rows_now)
+        for r in rows_now:
+            print(f"  {SLOT_NAMES[r['slot']]}: 5G {'да' if r['nr'] else 'нет'}, VoLTE {'да' if r['volte'] else 'нет'}, "
+                  f"VoWiFi {'да' if r['vowifi'] else 'нет'}", flush=True)
+        save_json(out / 'summary.json', results)
+
+    print('\n===== Итог подбора =====\n' + sweep_table(results), flush=True)
+    (out / 'summary.txt').write_text(sweep_table(results) + '\n', encoding='utf-8')
+    measured = [r for r in results if 'skipped' not in r]
+    if not measured:
+        print('Ни один профиль не удалось проверить. Журналы:', out, flush=True)
+        return 2
+    # Best bundle overall: summed over the chosen SIMs, earlier in the list wins a tie.
+    totals = {}
+    for r in measured:
+        totals[r['bundle']] = totals.get(r['bundle'], 0) + sweep_score(r)
+    best = max(totals, key=lambda n: (totals[n], -names.index(n)))
+    last = measured[-1]['bundle']
+    if totals[best] == 0:
+        print('Ни один профиль не дал ни 5G, ни VoLTE, ни VoWiFi. Смотрите подсказки в таблице. '
+              f'Сейчас стоит {last}. Журналы: {out}', flush=True)
+        return 0
+    if best != last:
+        print(f'\nЛучший профиль: {best}. Ставлю его обратно…', flush=True)
+        code = await install(best)
+        require(code == 0, f'Не удалось вернуть {best}. Поставьте его пунктом 7.')
+    print(f'\nГотово. Стоит лучший профиль: {best}. Чтобы он ставился пунктом 1, '
+          f'впишите в bundle.yaml строку «{measured[0]["plmn"]}: {best}».\nЖурналы: {out}', flush=True)
+    return 0
 
 
 async def execute(args,assets):
@@ -1834,13 +2080,16 @@ def main():
     group.add_argument('--recover',type=Path,nargs='?',const=Path('AUTO'),metavar='ЭТАП',help='восстановиться после сбоя автоматически; путь к этапу необязателен')
     group.add_argument('--diagnose',action='store_true',help='отчёт по SIM: IMS, VoLTE/VoWiFi/VoNR, роуминг, сеть, 5G SA; только чтение журнала')
     group.add_argument('--watch-call',action='store_true',help='слушать журнал во время тестового звонка: кодек (EVS/AMR), канал; только чтение')
+    group.add_argument('--sweep',nargs='?',const=','.join(SWEEP_DEFAULT),metavar='СПИСОК',
+                       help='подобрать профиль: поставить по очереди каждый (через запятую, по умолчанию '
+                            +', '.join(SWEEP_DEFAULT)+'), замерить 5G/VoLTE/VoWiFi и оставить лучший')
     parser.add_argument('--bundle',metavar='ПАКЕТ',
                         help='один системный пакет для всех выбранных SIM вместо bundle.yaml, например O2_Germany')
     parser.add_argument('--sims',choices=SLOT_CHOICES,default='all',
                         help='какие SIM менять (установка и --restore): 1, 2 или all — все найденные (по умолчанию)')
     parser.add_argument('--trigger',type=Path,metavar='IPCC',help='свой подписанный IPCC вместо комплектного; плата и SIM проверяются')
     parser.add_argument('--attempts',type=int,default=3,metavar='N',help='попытки при временном сбое связи (по умолчанию 3)')
-    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90) или --watch-call (по умолчанию 180)')
+    parser.add_argument('--seconds',type=int,metavar='СЕК',help='длительность --diagnose (по умолчанию 90), --watch-call (180) или замера в --sweep (120)')
     parser.add_argument('--wait-seconds',type=int,default=180,metavar='СЕК',help='ожидать подключение и разблокировку (по умолчанию 180 секунд)')
     parser.add_argument('--udid',metavar='ID',help='выбрать iPhone, если по USB подключено несколько')
     parser.add_argument('--apple-dir',action='append',default=[],metavar='ПАПКА',help='Windows: папка DLL Apple; можно указать несколько раз')
@@ -1857,7 +2106,10 @@ def main():
         args.bundles=load_bundle_config()
     require(1 <= args.attempts <= 10, 'Число попыток должно быть от 1 до 10.')
     require(0 <= args.wait_seconds <= 3600, 'Ожидание должно быть от 0 до 3600 секунд.')
-    args.seconds = args.seconds or (180 if args.watch_call else 90)
+    args.seconds = args.seconds or (180 if args.watch_call else 120 if args.sweep else 90)
+    if args.sweep:
+        require(not args.bundle, '--sweep и --bundle вместе не используются.')
+        sweep_names(args.sweep)
     require(10 <= args.seconds <= 1800, '--seconds: от 10 до 1800.')
     os.umask(0o077)
     require(sys.version_info >= (3,11), 'Нужен Python 3.11 или новее.')
