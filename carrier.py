@@ -1420,8 +1420,10 @@ def diag_report(state, rows):
             lines.append(f'    {name:20} {val}')
         if len(shown) < len(items):
             lines.append('    остальное: нет в журнале за это время')
-        for hint in diag_hints(s):
-            lines.append('    → ' + hint)
+        # Lines without a slot mix both SIMs: advice there only when an error is actually seen.
+        if slot != 'общее' or s.get('epdg_errors'):
+            for hint in diag_hints(s):
+                lines.append('    → ' + hint)
     return '\n'.join(lines)
 
 
